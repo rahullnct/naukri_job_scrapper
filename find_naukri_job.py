@@ -11,6 +11,7 @@ from urllib.parse import quote_plus, urlparse, urlunparse
 import hashlib
 from datetime import timezone
 from zipfile import BadZipFile
+from email.utils import parsedate_to_datetime
 
 import pandas as pd
 from playwright.async_api import async_playwright
@@ -398,7 +399,7 @@ async def scrape_job_detail_async(page, url: str, input_row: dict) -> dict:
         await safe_naukri_navigate(
             page, url, wait_until="domcontentloaded", timeout=60000, settle_ms=2000
         )
-    except NaukriAccessDenied:
+    except NaukriNavigationStop:
         raise
     except Exception as e:
         print(f"      [WARN] Detail page failed: {e}")
@@ -552,6 +553,26 @@ HTTP_403_COOLDOWNS_SECONDS = [
 HTTP_403_MAX_RETRIES = len(HTTP_403_COOLDOWNS_SECONDS)
 ACCESS_EVENTS_LOG_FILE = "naukri_access_events.log"
 
+# HTTP 429 = Naukri is rate-limiting. Also NOT a network failure. A valid
+# Retry-After header always wins (even when longer than the fallback); the
+# fallback below applies only when the header is missing or unusable.
+#   429 #1 -> wait 15 min (or Retry-After) -> retry the SAME URL
+#   429 #2 -> wait 30 min (or Retry-After) -> retry the SAME URL
+#   429 #3 -> wait 60 min (or Retry-After) -> retry the SAME URL
+#   429 #4 -> stop safely, state files untouched
+# The counter resets only after the same URL loads AND validates as a Naukri
+# page. Kept fully separate from the 403 policy above.
+HTTP_429_STATUS = 429
+HTTP_429_COOLDOWNS_SECONDS = [
+    15 * 60,
+    30 * 60,
+    60 * 60,
+]
+HTTP_429_MAX_RETRIES = len(HTTP_429_COOLDOWNS_SECONDS)
+# Sanity cap for Retry-After. Anything above is treated as unusable (logged),
+# so a corrupt header cannot park the worker for days.
+HTTP_429_RETRY_AFTER_MAX_SECONDS = 24 * 60 * 60
+
 # Title fragments of security/challenge interstitials. Used ONLY to log that a
 # non-403 response is not a normal job page. Nothing here tries to pass them.
 SECURITY_CHALLENGE_TITLE_MARKERS = (
@@ -566,16 +587,39 @@ SECURITY_CHALLENGE_TITLE_MARKERS = (
 )
 
 
-class NaukriAccessDenied(Exception):
-    """Raised when Naukri keeps returning HTTP 403 after every bounded retry."""
+class NaukriNavigationStop(Exception):
+    """Base for 'stop this worker, checkpoint preserved' navigation outcomes."""
+
+    status_label = "HTTP error"
 
     def __init__(self, url: str, attempts: int, context: dict):
         self.url = url
         self.attempts = attempts
         self.context = dict(context or {})
         super().__init__(
-            f"HTTP 403 from Naukri persisted after {attempts} retries: {url}"
+            f"{self.status_label} from Naukri persisted after {attempts} retries: {url}"
         )
+
+    def print_stop(self) -> None:
+        raise NotImplementedError
+
+
+class NaukriAccessDenied(NaukriNavigationStop):
+    """Raised when Naukri keeps returning HTTP 403 after every bounded retry."""
+
+    status_label = "HTTP 403"
+
+    def print_stop(self) -> None:
+        print_http_403_stop(self.url, self.context)
+
+
+class NaukriRateLimited(NaukriNavigationStop):
+    """Raised when Naukri keeps returning HTTP 429 after every bounded retry."""
+
+    status_label = "HTTP 429"
+
+    def print_stop(self) -> None:
+        print_http_429_stop(self.url, self.context)
 
 
 def current_checkpoint_context() -> dict:
@@ -604,7 +648,8 @@ def current_checkpoint_context() -> dict:
 
 def log_access_event(event: str, url: str, status, context: dict,
                      landed_url: str = "", attempt: int = 0,
-                     cooldown_seconds: int = 0, action: str = "") -> None:
+                     cooldown_seconds: int = 0, action: str = "",
+                     retry_after_raw: str = "", retry_after_seconds="") -> None:
     """Append one access/security event line. Never logs cookies or tokens."""
     ctx = context or {}
     fields = [
@@ -619,7 +664,9 @@ def log_access_event(event: str, url: str, status, context: dict,
         ("role_category", ctx.get("role_category", "")),
         ("search_keyword", ctx.get("search_keyword", "")),
         ("page_number", ctx.get("page_number", "")),
-        ("attempt_403", attempt),
+        ("attempt", attempt),
+        ("retry_after_raw", retry_after_raw if retry_after_raw is not None else ""),
+        ("retry_after_seconds", retry_after_seconds if retry_after_seconds is not None else ""),
         ("cooldown_seconds", cooldown_seconds),
         ("action", action),
     ]
@@ -663,6 +710,99 @@ def print_http_403_stop(url: str, context: dict) -> None:
     print(f"Page : {context.get('page_number', '—')}")
     print(f"URL  : {url}\n")
     print("Re-run the scraper after investigating the access issue.")
+    print("=" * 60 + "\n", flush=True)
+
+
+def parse_retry_after(raw_value):
+    """Parse a Retry-After header into whole seconds.
+
+    Returns (seconds, note). seconds is None when the header is absent,
+    malformed, negative, or above HTTP_429_RETRY_AFTER_MAX_SECONDS; note says
+    why, so the caller can log it and fall back to the configured policy.
+    Supports both forms allowed by RFC 9110: delta-seconds and HTTP-date.
+    """
+    if raw_value is None:
+        return None, "not provided"
+    text = str(raw_value).strip()
+    if not text:
+        return None, "empty"
+
+    seconds = None
+    if re.fullmatch(r"\d+", text):
+        seconds = int(text)
+        form = "seconds"
+    else:
+        try:
+            when = parsedate_to_datetime(text)
+        except (TypeError, ValueError, IndexError):
+            when = None
+        if when is None:
+            return None, f"malformed ({text[:40]!r})"
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        seconds = int(math.ceil((when - datetime.now(timezone.utc)).total_seconds()))
+        form = "http-date"
+
+    if seconds < 0:
+        # A date already in the past means "retry now"; still pause briefly
+        # via the configured fallback rather than hammering immediately.
+        return None, f"{form} in the past"
+    if seconds > HTTP_429_RETRY_AFTER_MAX_SECONDS:
+        return None, f"{form} exceeds {HTTP_429_RETRY_AFTER_MAX_SECONDS}s cap"
+    return seconds, form
+
+
+def _response_header(response, name: str):
+    """Header value from a Playwright response, or None. Never raises."""
+    if response is None:
+        return None
+    try:
+        headers = response.headers or {}
+        for key, value in headers.items():
+            if key.lower() == name.lower():
+                return value
+    except Exception:
+        pass
+    return None
+
+
+def print_http_429_banner(url: str, context: dict, attempt: int,
+                          cooldown_seconds: int, retry_after_raw,
+                          retry_after_seconds) -> None:
+    print("\n" + "=" * 60)
+    print("[HTTP 429 - TOO MANY REQUESTS]\n")
+    print("Naukri is currently rate-limiting this scraper.\n")
+    print(f"Requested URL : {url}")
+    print(f"City          : {context.get('city') or '—'}")
+    print(f"Role          : {context.get('search_keyword') or '—'}"
+          f"  ({context.get('role_category') or '—'})")
+    print(f"Page          : {context.get('page_number', '—')}")
+    print(f"Attempt       : {attempt}/{HTTP_429_MAX_RETRIES}\n")
+    print("Checkpoint    : PRESERVED")
+    if retry_after_seconds is not None:
+        print(f"Retry-After   : {retry_after_raw} ({retry_after_seconds} seconds)")
+        print(f"Cooldown      : {_format_minutes(cooldown_seconds)} (from Retry-After)")
+    else:
+        shown = "Not provided" if retry_after_raw in (None, "") else f"unusable: {retry_after_raw!r}"
+        print(f"Retry-After   : {shown}")
+        print(f"Cooldown      : {_format_minutes(cooldown_seconds)} (configured fallback)")
+    print("Next Action   : Retry EXACT SAME URL")
+    print("=" * 60 + "\n", flush=True)
+
+
+def print_http_429_stop(url: str, context: dict) -> None:
+    print("\n" + "=" * 60)
+    print("[HTTP 429 - PERSISTENT RATE LIMIT]\n")
+    print("Naukri continues to return HTTP 429.\n")
+    print("Automatic retries have been exhausted.\n")
+    print("Current checkpoint has been preserved.\n")
+    print(f"City          : {context.get('city') or '—'}")
+    print(f"Role          : {context.get('search_keyword') or '—'}"
+          f"  ({context.get('role_category') or '—'})")
+    print(f"Page          : {context.get('page_number', '—')}")
+    print(f"URL           : {url}\n")
+    print("No further Naukri requests will be sent by this worker.\n")
+    print("Manual investigation is required.")
     print("=" * 60 + "\n", flush=True)
 
 
@@ -710,8 +850,15 @@ async def safe_naukri_navigate(page, url: str, *, wait_until="domcontentloaded",
     On HTTP 403 the SAME url is retried after HTTP_403_COOLDOWNS_SECONDS
     [attempt-1]; after HTTP_403_MAX_RETRIES consecutive 403s
     NaukriAccessDenied is raised. Nothing here writes checkpoint state.
+
+    On HTTP 429 the SAME url is retried after Retry-After when usable, else
+    HTTP_429_COOLDOWNS_SECONDS[attempt-1]; after HTTP_429_MAX_RETRIES
+    consecutive rate-limit attempts NaukriRateLimited is raised. A response
+    that follows a 429 must also validate as a Naukri page before the 429
+    counter resets. The two counters and policies are independent.
     """
     consecutive_403 = 0
+    consecutive_429 = 0
     while True:
         wait_for_battery()
         wait_for_internet()
@@ -746,8 +893,74 @@ async def safe_naukri_navigate(page, url: str, *, wait_until="domcontentloaded",
             await asyncio.sleep(cooldown)
             continue
 
-        if settle_ms:
+        if status != HTTP_429_STATUS and settle_ms:
             await page.wait_for_timeout(settle_ms)
+
+        # Content validation for anything that is not a 4xx/5xx. Log-only on
+        # the normal path; decisive only when recovering from a 429.
+        challenge = False
+        if status is not None and status < 400 and status != HTTP_429_STATUS:
+            challenge = await detect_security_challenge(
+                page, url, status, context or current_checkpoint_context()
+            )
+
+        invalid_after_429 = bool(consecutive_429) and status != HTTP_429_STATUS and (
+            status is None or status >= 400 or challenge
+        )
+
+        if status == HTTP_429_STATUS or invalid_after_429:
+            consecutive_429 += 1
+            ctx = context or current_checkpoint_context()
+            if consecutive_429 > HTTP_429_MAX_RETRIES:
+                log_access_event(
+                    "HTTP_429_STOP", url, status, ctx, landed_url=landed,
+                    attempt=consecutive_429, action="retries exhausted; stopping",
+                )
+                raise NaukriRateLimited(url, HTTP_429_MAX_RETRIES, ctx)
+
+            retry_after_raw = None
+            retry_after_seconds, note = None, "not provided"
+            if status == HTTP_429_STATUS:
+                retry_after_raw = _response_header(response, "Retry-After")
+                retry_after_seconds, note = parse_retry_after(retry_after_raw)
+                if retry_after_raw is not None and retry_after_seconds is None:
+                    print(f"  [HTTP 429] Retry-After header unusable ({note}); "
+                          "using configured fallback cooldown.", flush=True)
+            else:
+                print(f"  [HTTP 429 - RECOVERY NOT VALID] Retry returned HTTP {status} "
+                      "but not a normal Naukri page; treating as still rate-limited.",
+                      flush=True)
+
+            if retry_after_seconds is not None:
+                cooldown = retry_after_seconds
+            else:
+                cooldown = HTTP_429_COOLDOWNS_SECONDS[consecutive_429 - 1]
+
+            print_http_429_banner(url, ctx, consecutive_429, cooldown,
+                                  retry_after_raw, retry_after_seconds)
+            log_access_event(
+                "HTTP_429" if status == HTTP_429_STATUS else "HTTP_429_INVALID_RECOVERY",
+                url, status, ctx, landed_url=landed,
+                attempt=consecutive_429, cooldown_seconds=cooldown,
+                retry_after_raw=retry_after_raw if retry_after_raw is not None else "",
+                retry_after_seconds=retry_after_seconds if retry_after_seconds is not None else "",
+                action=f"checkpoint preserved; cooldown ({note}) then retry same URL",
+            )
+            resume_at = datetime.fromtimestamp(time.time() + cooldown)
+            print(f"  Paused. Retrying the same URL at "
+                  f"{resume_at.strftime('%H:%M:%S')}", flush=True)
+            await asyncio.sleep(cooldown)
+            continue
+
+        if consecutive_429:
+            ctx = context or current_checkpoint_context()
+            print(f"  [HTTP 429 - RECOVERED] URL loaded with HTTP {status} and validated "
+                  f"after {consecutive_429} cooldown(s). Resuming where paused.", flush=True)
+            log_access_event(
+                "HTTP_429_RECOVERED", url, status, ctx, landed_url=landed,
+                attempt=consecutive_429, action="same URL loaded and validated; counter reset",
+            )
+            consecutive_429 = 0
 
         if consecutive_403:
             ctx = context or current_checkpoint_context()
@@ -761,13 +974,10 @@ async def safe_naukri_navigate(page, url: str, *, wait_until="domcontentloaded",
 
         if status is not None and status >= 400:
             ctx = context or current_checkpoint_context()
-            print(f"  [HTTP {status}] Non-403 error status; existing logic decides.",
+            print(f"  [HTTP {status}] Non-403/429 error status; existing logic decides.",
                   flush=True)
             log_access_event("HTTP_ERROR", url, status, ctx, landed_url=landed,
                              action="logged only")
-        elif status is not None:
-            await detect_security_challenge(page, url, status,
-                                            context or current_checkpoint_context())
 
         return response
 
@@ -1205,7 +1415,7 @@ async def main():
                                 page, search_url, wait_until="domcontentloaded",
                                 timeout=60000, settle_ms=WAIT_SECONDS * 1000,
                             )
-                        except NaukriAccessDenied:
+                        except NaukriNavigationStop:
                             raise      # handled once, in the combo-level handler
                         except Exception as nav_err:
                             err_msg = str(nav_err).lower()
@@ -1220,7 +1430,7 @@ async def main():
                                         page, search_url, wait_until="domcontentloaded",
                                         timeout=60000, settle_ms=WAIT_SECONDS * 1000,
                                     )
-                                except NaukriAccessDenied:
+                                except NaukriNavigationStop:
                                     raise
                                 except Exception as retry_err:
                                     print(f"  Retry failed: {retry_err} — exiting")
@@ -1304,10 +1514,11 @@ async def main():
                 # combo fully done — reset page to 1 ready for next combo
                 save_city_state(location, page_number=1)
 
-            except NaukriAccessDenied as denied:
-                # Checkpoint files still hold the paused city/role/page:
-                # nothing after the failed navigation ran, so nothing advanced.
-                print_http_403_stop(denied.url, denied.context)
+            except NaukriNavigationStop as stopped:
+                # 403 or 429 retries exhausted. Checkpoint files still hold the
+                # paused city/role/page: nothing after the failed navigation
+                # ran, so nothing advanced.
+                stopped.print_stop()
                 try:
                     await context.close()
                 except Exception:
