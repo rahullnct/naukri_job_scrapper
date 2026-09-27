@@ -1,0 +1,6 @@
+openpyxl
+pandas
+playwright
+Levenshtein
+gtts
+psutil
