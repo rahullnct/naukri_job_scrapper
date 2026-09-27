@@ -5,6 +5,7 @@ import json
 import time
 import math
 import socket
+import random
 from datetime import datetime
 from urllib.parse import quote_plus, urlparse, urlunparse
 #from naukri_job_detail_scraper import run_detail_scraper
@@ -397,9 +398,10 @@ async def scrape_job_detail_async(page, url: str, input_row: dict) -> dict:
     try:
         # HTTP 403 handled inside (same-URL bounded retry); other errors as before.
         await safe_naukri_navigate(
-            page, url, wait_until="domcontentloaded", timeout=60000, settle_ms=2000
+            page, url, wait_until="domcontentloaded", timeout=60000, settle_ms=2000,
+            nav_type="JOB_DETAIL", job_url=url,
         )
-    except NaukriNavigationStop:
+    except (NaukriNavigationStop, NaukriServerError):
         raise
     except Exception as e:
         print(f"      [WARN] Detail page failed: {e}")
@@ -573,6 +575,23 @@ HTTP_429_MAX_RETRIES = len(HTTP_429_COOLDOWNS_SECONDS)
 # so a corrupt header cannot park the worker for days.
 HTTP_429_RETRY_AFTER_MAX_SECONDS = 24 * 60 * 60
 
+# HTTP 5xx = temporary server/CDN fault. Also NOT a network failure and NOT
+# 403/429. Policy: retry the SAME URL with exponential backoff + jitter
+# (~5, 10, 20, 40 s). If still 5xx the caller DEFERS the item into a
+# persisted queue (listing pages and job details are queued separately),
+# continues with the remaining work, and retries the queue later with a
+# small separate budget. Nothing here rotates anything or bypasses anything.
+HTTP_5XX_STATUSES = {500, 502, 503, 504}
+HTTP_5XX_BASE_DELAY_SECONDS = 5
+HTTP_5XX_MAX_IMMEDIATE_RETRIES = 4
+HTTP_5XX_JITTER_FRACTION = 0.2                 # +/- 20% of the base delay
+HTTP_5XX_PAGE_DEFER_COOLDOWN_SECONDS = 10 * 60 # wait before the next known page
+HTTP_5XX_DEFERRED_PAGE_MAX_RETRIES = 2
+HTTP_5XX_DEFERRED_JOB_MAX_RETRIES = 2
+FAILED_5XX_PAGE_QUEUE_FILE = "state_5xx_pages.json"   # FAILED_5XX_PAGE_QUEUE
+FAILED_5XX_JOB_QUEUE_FILE = "state_5xx_jobs.json"     # FAILED_5XX_JOB_QUEUE
+UNRESOLVED_5XX_FILE = "naukri_5xx_unresolved.json"
+
 # Title fragments of security/challenge interstitials. Used ONLY to log that a
 # non-403 response is not a normal job page. Nothing here tries to pass them.
 SECURITY_CHALLENGE_TITLE_MARKERS = (
@@ -622,6 +641,23 @@ class NaukriRateLimited(NaukriNavigationStop):
         print_http_429_stop(self.url, self.context)
 
 
+class NaukriServerError(Exception):
+    """HTTP 5xx persisted through every immediate retry of one URL.
+
+    Deliberately NOT a NaukriNavigationStop: the worker must not stop. The
+    caller defers the item (listing page or job) and continues.
+    """
+
+    def __init__(self, url: str, status: int, attempts: int, context: dict):
+        self.url = url
+        self.status = status
+        self.attempts = attempts
+        self.context = dict(context or {})
+        super().__init__(
+            f"HTTP {status} from Naukri persisted after {attempts} immediate retries: {url}"
+        )
+
+
 def current_checkpoint_context() -> dict:
     """Position as recorded in the EXISTING checkpoint files.
 
@@ -649,7 +685,9 @@ def current_checkpoint_context() -> dict:
 def log_access_event(event: str, url: str, status, context: dict,
                      landed_url: str = "", attempt: int = 0,
                      cooldown_seconds: int = 0, action: str = "",
-                     retry_after_raw: str = "", retry_after_seconds="") -> None:
+                     retry_after_raw: str = "", retry_after_seconds="",
+                     nav_type: str = "", job_url: str = "", deferred_attempt="",
+                     jitter_seconds="") -> None:
     """Append one access/security event line. Never logs cookies or tokens."""
     ctx = context or {}
     fields = [
@@ -664,7 +702,11 @@ def log_access_event(event: str, url: str, status, context: dict,
         ("role_category", ctx.get("role_category", "")),
         ("search_keyword", ctx.get("search_keyword", "")),
         ("page_number", ctx.get("page_number", "")),
+        ("nav_type", nav_type),
+        ("job_url", job_url),
         ("attempt", attempt),
+        ("deferred_attempt", deferred_attempt),
+        ("jitter_seconds", jitter_seconds),
         ("retry_after_raw", retry_after_raw if retry_after_raw is not None else ""),
         ("retry_after_seconds", retry_after_seconds if retry_after_seconds is not None else ""),
         ("cooldown_seconds", cooldown_seconds),
@@ -806,6 +848,172 @@ def print_http_429_stop(url: str, context: dict) -> None:
     print("=" * 60 + "\n", flush=True)
 
 
+def http_5xx_backoff_seconds(retry_index: int):
+    """(delay, jitter) for immediate 5xx retry number retry_index (0-based).
+
+    delay = base * 2**index, plus a uniform jitter of +/- HTTP_5XX_JITTER_FRACTION
+    so several ranks do not retry at exactly the same moment. Never below 1 s.
+    """
+    base = HTTP_5XX_BASE_DELAY_SECONDS * (2 ** retry_index)
+    jitter = random.uniform(-HTTP_5XX_JITTER_FRACTION, HTTP_5XX_JITTER_FRACTION) * base
+    return max(1.0, base + jitter), jitter
+
+
+def _status_reason(status) -> str:
+    return {
+        500: "INTERNAL SERVER ERROR", 502: "BAD GATEWAY",
+        503: "SERVICE UNAVAILABLE", 504: "GATEWAY TIMEOUT",
+    }.get(status, "SERVER ERROR")
+
+
+def print_http_5xx_retry_banner(url: str, status, context: dict, nav_type: str,
+                                attempt: int, delay: float, job_url: str = "") -> None:
+    print("\n" + "=" * 60)
+    print(f"[HTTP {status} - {_status_reason(status)}]\n")
+    print(f"Type          : {nav_type.replace('_', ' ')}")
+    print(f"City          : {context.get('city') or '—'}")
+    print(f"Role          : {context.get('search_keyword') or '—'}"
+          f"  ({context.get('role_category') or '—'})")
+    print(f"Page          : {context.get('page_number', '—')}")
+    if job_url:
+        print(f"Job URL       : {job_url}")
+    print(f"Attempt       : {attempt}/{HTTP_5XX_MAX_IMMEDIATE_RETRIES}")
+    print(f"Retry In      : {delay:.1f} seconds")
+    print("Action        : Retry SAME URL")
+    print("=" * 60 + "\n", flush=True)
+
+
+def print_http_5xx_page_deferred(status, context: dict, page_number, page1_case: bool) -> None:
+    print("\n" + "=" * 60)
+    print("[PERSISTENT 5xx - LISTING PAGE DEFERRED]\n")
+    print(f"Status        : {status}")
+    print(f"City          : {context.get('city') or '—'}")
+    print(f"Role          : {context.get('search_keyword') or '—'}"
+          f"  ({context.get('role_category') or '—'})")
+    print(f"Page          : {page_number}\n")
+    print("Immediate retries exhausted.\n")
+    print("Action:")
+    if page1_case:
+        print("1. Whole search combination added to FAILED_5XX_PAGE_QUEUE (total pages unknown)")
+        print(f"2. Wait {HTTP_5XX_PAGE_DEFER_COOLDOWN_SECONDS // 60} minutes")
+        print("3. Continue to the next search combination (this one is NOT marked done)")
+        print("4. Retry Page 1 later; its remaining pages are discovered only after it loads")
+    else:
+        print(f"1. Page {page_number} added to FAILED_5XX_PAGE_QUEUE")
+        print(f"2. Wait {HTTP_5XX_PAGE_DEFER_COOLDOWN_SECONDS // 60} minutes")
+        print(f"3. Continue to Page {int(page_number) + 1}")
+        print(f"4. Retry Page {page_number} after the last known page")
+    print("=" * 60 + "\n", flush=True)
+
+
+def print_http_5xx_job_deferred(status, job_url: str, page_number) -> None:
+    print("\n" + "=" * 60)
+    print("[PERSISTENT 5xx - JOB DEFERRED]\n")
+    print(f"Status        : {status}")
+    print(f"Job URL       : {job_url}")
+    print(f"Listing Page  : {page_number}\n")
+    print("Immediate retries exhausted.\n")
+    print("Action:")
+    print("1. Job added to FAILED_5XX_JOB_QUEUE")
+    print("2. Continue remaining job cards")
+    print("3. Retry this job after normal cards are processed")
+    print("=" * 60 + "\n", flush=True)
+
+
+# ---- persisted 5xx queues (plain JSON lists next to the existing state files)
+
+def load_5xx_queue(path: str) -> list:
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def save_5xx_queue(path: str, items: list) -> None:
+    """Atomic write (temp file + os.replace) so Ctrl+C cannot corrupt the queue."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(items, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def enqueue_5xx_item(path: str, entry: dict) -> dict:
+    """Add or refresh a failed item keyed by URL. Idempotent. Returns stored entry."""
+    items = load_5xx_queue(path)
+    for existing in items:
+        if existing.get("url") == entry.get("url"):
+            existing["last_status"] = entry.get("last_status")
+            existing["last_failed_at"] = now_time()
+            existing["normal_attempts"] = int(existing.get("normal_attempts", 0)) + int(entry.get("normal_attempts", 0))
+            save_5xx_queue(path, items)
+            return existing
+    entry = dict(entry)
+    entry.setdefault("deferred_attempts", 0)
+    entry.setdefault("first_failed_at", now_time())
+    entry["last_failed_at"] = now_time()
+    items.append(entry)
+    save_5xx_queue(path, items)
+    return entry
+
+
+def remove_5xx_item(path: str, url: str) -> None:
+    items = [i for i in load_5xx_queue(path) if i.get("url") != url]
+    save_5xx_queue(path, items)
+
+
+def update_5xx_item(path: str, entry: dict) -> None:
+    items = load_5xx_queue(path)
+    for idx, existing in enumerate(items):
+        if existing.get("url") == entry.get("url"):
+            items[idx] = entry
+            break
+    else:
+        items.append(entry)
+    save_5xx_queue(path, items)
+
+
+def record_5xx_unresolved(kind: str, entry: dict) -> None:
+    """Persist an item whose deferred budget is exhausted. Never silently dropped."""
+    items = load_5xx_queue(UNRESOLVED_5XX_FILE)
+    record = dict(entry)
+    record["kind"] = kind
+    record["recorded_at"] = now_time()
+    items.append(record)
+    save_5xx_queue(UNRESOLVED_5XX_FILE, items)
+    log_access_event(
+        "HTTP_5XX_UNRESOLVED", entry.get("url", ""), entry.get("last_status"),
+        {"rank": rank, "city": entry.get("city", ""), "state": entry.get("state", ""),
+         "role_category": entry.get("role_category", ""),
+         "search_keyword": entry.get("search_keyword", ""),
+         "page_number": entry.get("page_number", "")},
+        nav_type=kind, job_url=entry.get("url", "") if kind == "JOB_DETAIL" else "",
+        deferred_attempt=entry.get("deferred_attempts", ""),
+        action=f"deferred budget exhausted; recorded in {UNRESOLVED_5XX_FILE}",
+    )
+
+
+async def validate_listing_page(page, url: str, status, context: dict) -> bool:
+    """A recovered listing page must be a real Naukri search page, not just 200."""
+    if status is None or status >= 400:
+        return False
+    if await detect_security_challenge(page, url, status, context):
+        return False
+    try:
+        landed = page.url or ""
+        parsed = urlparse(landed)
+    except Exception:
+        return False
+    if "naukri.com" not in parsed.netloc.lower():
+        return False
+    if "jobs" not in parsed.path.lower():
+        return False
+    return True
+
+
 async def detect_security_challenge(page, url: str, status, context: dict) -> bool:
     """Log-only check that a non-403 response looks like a Naukri page.
 
@@ -839,7 +1047,8 @@ async def detect_security_challenge(page, url: str, status, context: dict) -> bo
 
 
 async def safe_naukri_navigate(page, url: str, *, wait_until="domcontentloaded",
-                               timeout=60000, settle_ms=0, context=None):
+                               timeout=60000, settle_ms=0, context=None,
+                               nav_type="LISTING_PAGE", job_url=""):
     """Navigate to a Naukri URL with bounded HTTP 403 recovery.
 
     Normal path is identical to the old inline code: battery wait, internet
@@ -856,9 +1065,14 @@ async def safe_naukri_navigate(page, url: str, *, wait_until="domcontentloaded",
     consecutive rate-limit attempts NaukriRateLimited is raised. A response
     that follows a 429 must also validate as a Naukri page before the 429
     counter resets. The two counters and policies are independent.
+
+    On HTTP 500/502/503/504 the SAME url is retried after ~5/10/20/40 s with
+    jitter; after HTTP_5XX_MAX_IMMEDIATE_RETRIES NaukriServerError is raised so
+    the caller can defer the item. Not a stop, not a network error.
     """
     consecutive_403 = 0
     consecutive_429 = 0
+    consecutive_5xx = 0
     while True:
         wait_for_battery()
         wait_for_internet()
@@ -893,8 +1107,38 @@ async def safe_naukri_navigate(page, url: str, *, wait_until="domcontentloaded",
             await asyncio.sleep(cooldown)
             continue
 
+        if status in HTTP_5XX_STATUSES:
+            consecutive_5xx += 1
+            ctx = context or current_checkpoint_context()
+            if consecutive_5xx > HTTP_5XX_MAX_IMMEDIATE_RETRIES:
+                log_access_event(
+                    "HTTP_5XX_EXHAUSTED", url, status, ctx, landed_url=landed,
+                    nav_type=nav_type, job_url=job_url, attempt=consecutive_5xx - 1,
+                    action="immediate retries exhausted; caller defers item",
+                )
+                raise NaukriServerError(url, status, HTTP_5XX_MAX_IMMEDIATE_RETRIES, ctx)
+            delay, jitter = http_5xx_backoff_seconds(consecutive_5xx - 1)
+            print_http_5xx_retry_banner(url, status, ctx, nav_type, consecutive_5xx,
+                                        delay, job_url)
+            log_access_event(
+                "HTTP_5XX", url, status, ctx, landed_url=landed, nav_type=nav_type,
+                job_url=job_url, attempt=consecutive_5xx, cooldown_seconds=round(delay, 1),
+                jitter_seconds=round(jitter, 2), action="backoff then retry same URL",
+            )
+            await asyncio.sleep(delay)
+            continue
+
         if status != HTTP_429_STATUS and settle_ms:
             await page.wait_for_timeout(settle_ms)
+
+        if consecutive_5xx:
+            ctx = context or current_checkpoint_context()
+            print(f"  [HTTP 5xx - RECOVERED] URL loaded with HTTP {status} after "
+                  f"{consecutive_5xx} short retry(ies).", flush=True)
+            log_access_event("HTTP_5XX_RECOVERED", url, status, ctx, landed_url=landed,
+                             nav_type=nav_type, job_url=job_url, attempt=consecutive_5xx,
+                             action="same URL loaded during immediate retry")
+            consecutive_5xx = 0
 
         # Content validation for anything that is not a 4xx/5xx. Log-only on
         # the normal path; decisive only when recovering from a 429.
@@ -974,7 +1218,7 @@ async def safe_naukri_navigate(page, url: str, *, wait_until="domcontentloaded",
 
         if status is not None and status >= 400:
             ctx = context or current_checkpoint_context()
-            print(f"  [HTTP {status}] Non-403/429 error status; existing logic decides.",
+            print(f"  [HTTP {status}] Non-403/429/5xx error status; existing logic decides.",
                   flush=True)
             log_access_event("HTTP_ERROR", url, status, ctx, landed_url=landed,
                              action="logged only")
@@ -1357,6 +1601,259 @@ async def main():
         page = await context.new_page()
         detail_page = await context.new_page()
 
+        # ------------------------------------------------------------------
+        # 5xx recovery helpers. Nested so they share existing_data, page and
+        # detail_page without changing any existing signature.
+        # ------------------------------------------------------------------
+        def _page_ctx(state_name, role_category, search_keyword, location, page_number):
+            return {"rank": rank, "city": location, "state": state_name,
+                    "role_category": role_category, "search_keyword": search_keyword,
+                    "page_number": page_number}
+
+        async def process_deferred_jobs(page_number_hint=None):
+            """FAILED_5XX_JOB_QUEUE: one bounded deferred attempt per entry."""
+            queue = load_5xx_queue(FAILED_5XX_JOB_QUEUE_FILE)
+            if not queue:
+                return
+            print(f"\n  [5xx JOB QUEUE] {len(queue)} deferred job(s) to retry", flush=True)
+            for entry in queue:
+                job_url = entry.get("url", "")
+                input_row = entry.get("input_row") or {}
+                ctx = _page_ctx(entry.get("state", ""), entry.get("role_category", ""),
+                                entry.get("search_keyword", ""), entry.get("city", ""),
+                                entry.get("page_number", page_number_hint))
+                attempt_no = int(entry.get("deferred_attempts", 0)) + 1
+                print(f"    Deferred job retry {attempt_no}/{HTTP_5XX_DEFERRED_JOB_MAX_RETRIES} "
+                      f"→ {job_url}", flush=True)
+                try:
+                    detail_row = await scrape_job_detail_async(detail_page, job_url, input_row)
+                    failed_status = None
+                except NaukriServerError as srv:
+                    detail_row, failed_status = None, srv.status
+                if isinstance(detail_row, dict):
+                    # Real success: navigated, passed the P5 job-id guard, row built.
+                    append_detail_to_excel(detail_row, "current_data.xlsx")
+                    remove_5xx_item(FAILED_5XX_JOB_QUEUE_FILE, job_url)
+                    log_access_event("HTTP_5XX_JOB_RECOVERED", job_url, 200, ctx,
+                                     nav_type="JOB_DETAIL", job_url=job_url,
+                                     deferred_attempt=attempt_no,
+                                     action="deferred job saved; removed from queue")
+                    continue
+                # Still 5xx, or the stale-page guard dropped it: not a success.
+                entry["deferred_attempts"] = attempt_no
+                entry["last_failed_at"] = now_time()
+                if failed_status is not None:
+                    entry["last_status"] = failed_status
+                if attempt_no >= HTTP_5XX_DEFERRED_JOB_MAX_RETRIES:
+                    remove_5xx_item(FAILED_5XX_JOB_QUEUE_FILE, job_url)
+                    record_5xx_unresolved("JOB_DETAIL", entry)
+                    print(f"    ⚠️  Job still failing after {attempt_no} deferred retries; "
+                          f"recorded in {UNRESOLVED_5XX_FILE}, continuing.", flush=True)
+                else:
+                    update_5xx_item(FAILED_5XX_JOB_QUEUE_FILE, entry)
+                    log_access_event("HTTP_5XX_JOB_DEFERRED_AGAIN", job_url, failed_status, ctx,
+                                     nav_type="JOB_DETAIL", job_url=job_url,
+                                     deferred_attempt=attempt_no, action="kept in queue")
+
+        async def process_listing_jobs(state_name, role_category, search_keyword,
+                                       location, page_number):
+            """Extract and process every job card on the page that is ALREADY loaded.
+
+            This is the original inline per-page block, moved verbatim so the
+            deferred-page pass can reuse it. Only addition: a 5xx on one job's
+            detail page defers that job instead of aborting the page.
+            """
+            jobs = await extract_jobs_from_page(page)
+            print(f"    Scraped {len(jobs)} job titles")
+
+            for job in jobs:
+                job_title = job["job_title"]
+                sample_job_url = job["sample_job_url"]
+                key = make_unique_key(role_category, job_title, location)
+
+                if key in existing_data:
+                    try:
+                        old = int(existing_data[key].get("seen_count", 0))
+                    except Exception:
+                        old = 0
+
+                    existing_data[key]["seen_count"] = old + 1
+                    existing_data[key]["last_seen_at"] = now_time()
+                    existing_data[key]["is_active"] = 1
+
+                    if not existing_data[key].get("sample_job_url"):
+                        existing_data[key]["sample_job_url"] = sample_job_url
+
+                else:
+                     existing_data[key] = {
+                         "state": state_name,
+                         "role_category": role_category,
+                         "job_title": job_title,
+                         "location": location,
+                         "search_keyword": search_keyword,
+                         "sample_job_url": sample_job_url,
+                         "first_seen_at": now_time(),
+                         "last_seen_at": now_time(),
+                         "seen_count": 1,
+                         "is_active": 1,
+                         "source_platform": "Naukri",
+                         "source_type": "job_portal",
+                     }
+
+                input_row = {
+                    "state": state_name,
+                    "role_category": role_category,
+                    "job_title": job_title,
+                    "location": location,
+                    "city": location,
+                    "search_keyword": search_keyword,
+                    "sample_job_url": sample_job_url,
+                    "source_platform": "Naukri",
+                    "source_type": "job_portal",
+                    "is_fake": False,
+                    "is_active": True,
+                }
+
+                try:
+                    detail_row = await scrape_job_detail_async(
+                        detail_page,
+                        sample_job_url,
+                        input_row
+                    )
+                except NaukriServerError as srv:
+                    # One job's detail page is down: defer it, keep the other cards.
+                    print_http_5xx_job_deferred(srv.status, sample_job_url, page_number)
+                    enqueue_5xx_item(FAILED_5XX_JOB_QUEUE_FILE, {
+                        "url": sample_job_url, "job_title": job_title,
+                        "city": location, "state": state_name,
+                        "role_category": role_category, "search_keyword": search_keyword,
+                        "page_number": page_number, "input_row": input_row,
+                        "last_status": srv.status, "normal_attempts": srv.attempts,
+                    })
+                    log_access_event("HTTP_5XX_JOB_DEFERRED", sample_job_url, srv.status,
+                                     _page_ctx(state_name, role_category, search_keyword,
+                                               location, page_number),
+                                     nav_type="JOB_DETAIL", job_url=sample_job_url,
+                                     attempt=srv.attempts, action="added to FAILED_5XX_JOB_QUEUE")
+                    continue
+
+                append_detail_to_excel(detail_row, "current_data.xlsx")
+            updated_df = pd.DataFrame(existing_data.values())
+            save_master(updated_df)
+            print(f"    Saved → {OUTPUT_FILE}  |  Total unique: {len(updated_df):,}")
+
+            # Normal cards done → retry this page's (and any older) deferred jobs.
+            await process_deferred_jobs(page_number)
+            return len(jobs)
+
+        async def defer_listing_page(state_name, role_category, search_keyword, location,
+                                     page_number, url, status, attempts, total_pages=None):
+            """Persist a page whose immediate 5xx retries failed, then cool down."""
+            page1_case = total_pages is None
+            enqueue_5xx_item(FAILED_5XX_PAGE_QUEUE_FILE, {
+                "url": url, "city": location, "state": state_name,
+                "role_category": role_category, "search_keyword": search_keyword,
+                "page_number": page_number, "total_pages": total_pages,
+                "last_status": status, "normal_attempts": attempts,
+            })
+            ctx = _page_ctx(state_name, role_category, search_keyword, location, page_number)
+            print_http_5xx_page_deferred(status, ctx, page_number, page1_case)
+            log_access_event(
+                "HTTP_5XX_PAGE_DEFERRED", url, status, ctx, nav_type="LISTING_PAGE",
+                attempt=attempts, cooldown_seconds=HTTP_5XX_PAGE_DEFER_COOLDOWN_SECONDS,
+                action=("whole search combination deferred (page 1, total pages unknown)"
+                        if page1_case else "added to FAILED_5XX_PAGE_QUEUE; cooldown before next page"),
+            )
+            resume_at = datetime.fromtimestamp(time.time() + HTTP_5XX_PAGE_DEFER_COOLDOWN_SECONDS)
+            print(f"  Cooling down until {resume_at.strftime('%H:%M:%S')} before continuing.",
+                  flush=True)
+            await asyncio.sleep(HTTP_5XX_PAGE_DEFER_COOLDOWN_SECONDS)
+
+        async def process_deferred_pages():
+            """FAILED_5XX_PAGE_QUEUE: one bounded deferred attempt per entry.
+
+            A page-1 entry that loads has its remaining pages discovered from
+            the real total and appended to this same queue as fresh entries,
+            so no page number is ever invented.
+            """
+            queue = load_5xx_queue(FAILED_5XX_PAGE_QUEUE_FILE)
+            if not queue:
+                return
+            print(f"\n  [5xx PAGE QUEUE] {len(queue)} deferred listing page(s) to retry", flush=True)
+            idx = 0
+            while idx < len(queue):
+                entry = queue[idx]
+                idx += 1
+                url = entry.get("url", "")
+                state_name = entry.get("state", "")
+                role_category = entry.get("role_category", "")
+                search_keyword = entry.get("search_keyword", "")
+                location = entry.get("city", "")
+                page_number = int(entry.get("page_number", 1))
+                ctx = _page_ctx(state_name, role_category, search_keyword, location, page_number)
+                attempt_no = int(entry.get("deferred_attempts", 0)) + 1
+                print(f"\n  Deferred page retry {attempt_no}/{HTTP_5XX_DEFERRED_PAGE_MAX_RETRIES} "
+                      f"→ {search_keyword} | {location} | page {page_number}\n  {url}", flush=True)
+                failed_status = None
+                valid = False
+                try:
+                    response = await safe_naukri_navigate(
+                        page, url, wait_until="domcontentloaded", timeout=60000,
+                        settle_ms=WAIT_SECONDS * 1000, context=ctx, nav_type="LISTING_PAGE",
+                    )
+                    status = response.status if response is not None else None
+                    valid = await validate_listing_page(page, url, status, ctx)
+                    if not valid:
+                        failed_status = status
+                        print(f"  [5xx QUEUE] HTTP {status} but not a valid listing page; "
+                              "not counted as recovered.", flush=True)
+                except NaukriServerError as srv:
+                    failed_status = srv.status
+
+                if valid:
+                    if entry.get("total_pages") is None and page_number == 1:
+                        # Page 1 of a deferred combination: discover the real total now.
+                        total_jobs = await get_total_jobs(page)
+                        total_pages = calculate_total_pages(total_jobs)
+                        print(f"  Deferred combination: {total_jobs:,} jobs → {total_pages} pages")
+                        for later in range(2, total_pages + 1):
+                            later_url = build_search_url(search_keyword, location, later)
+                            if any(q.get("url") == later_url for q in queue):
+                                continue
+                            later_entry = enqueue_5xx_item(FAILED_5XX_PAGE_QUEUE_FILE, {
+                                "url": later_url, "city": location, "state": state_name,
+                                "role_category": role_category,
+                                "search_keyword": search_keyword,
+                                "page_number": later, "total_pages": total_pages,
+                                "last_status": None, "normal_attempts": 0,
+                                "expanded_from_page1": True,
+                            })
+                            queue.append(later_entry)
+                    await process_listing_jobs(state_name, role_category, search_keyword,
+                                               location, page_number)
+                    remove_5xx_item(FAILED_5XX_PAGE_QUEUE_FILE, url)
+                    log_access_event("HTTP_5XX_PAGE_RECOVERED", url, 200, ctx,
+                                     nav_type="LISTING_PAGE", deferred_attempt=attempt_no,
+                                     action="deferred page processed; removed from queue")
+                    await asyncio.sleep(WAIT_SECONDS)
+                    continue
+
+                entry["deferred_attempts"] = attempt_no
+                entry["last_failed_at"] = now_time()
+                if failed_status is not None:
+                    entry["last_status"] = failed_status
+                if attempt_no >= HTTP_5XX_DEFERRED_PAGE_MAX_RETRIES:
+                    remove_5xx_item(FAILED_5XX_PAGE_QUEUE_FILE, url)
+                    record_5xx_unresolved("LISTING_PAGE", entry)
+                    print(f"  ⚠️  Page still failing after {attempt_no} deferred retries; "
+                          f"recorded in {UNRESOLVED_5XX_FILE}, continuing.", flush=True)
+                else:
+                    update_5xx_item(FAILED_5XX_PAGE_QUEUE_FILE, entry)
+                    log_access_event("HTTP_5XX_PAGE_DEFERRED_AGAIN", url, failed_status, ctx,
+                                     nav_type="LISTING_PAGE", deferred_attempt=attempt_no,
+                                     action="kept in queue")
+                await asyncio.sleep(HTTP_5XX_PAGE_DEFER_COOLDOWN_SECONDS)
+
         for search_index in range(start_search_index, total):
             seed           = ALL_SEARCHES[search_index]
             state_name     = seed["state"]
@@ -1417,6 +1914,13 @@ async def main():
                             )
                         except NaukriNavigationStop:
                             raise      # handled once, in the combo-level handler
+                        except NaukriServerError as srv:
+                            await defer_listing_page(
+                                state_name, role_category, search_keyword, location,
+                                page_number, search_url, srv.status, srv.attempts,
+                                total_pages=total_pages,
+                            )
+                            continue   # next KNOWN page; this one is queued
                         except Exception as nav_err:
                             err_msg = str(nav_err).lower()
                             if any(k in err_msg for k in
@@ -1432,6 +1936,13 @@ async def main():
                                     )
                                 except NaukriNavigationStop:
                                     raise
+                                except NaukriServerError as srv:
+                                    await defer_listing_page(
+                                        state_name, role_category, search_keyword, location,
+                                        page_number, search_url, srv.status, srv.attempts,
+                                        total_pages=total_pages,
+                                    )
+                                    continue
                                 except Exception as retry_err:
                                     print(f"  Retry failed: {retry_err} — exiting")
                                     await browser.close()
@@ -1443,76 +1954,32 @@ async def main():
                     else:
                         print(f"  Page 1/{total_pages}  (already loaded)")
 
-                    jobs = await extract_jobs_from_page(page)
-                    print(f"    Scraped {len(jobs)} job titles")
+                    jobs_on_page = await process_listing_jobs(
+                        state_name, role_category, search_keyword, location, page_number
+                    )
 
-                    for job in jobs:
-                        job_title = job["job_title"]
-                        sample_job_url = job["sample_job_url"]
-                        key = make_unique_key(role_category, job_title, location)
-
-                        if key in existing_data:
-                            try:
-                                old = int(existing_data[key].get("seen_count", 0))
-                            except Exception:
-                                old = 0
-
-                            existing_data[key]["seen_count"] = old + 1
-                            existing_data[key]["last_seen_at"] = now_time()
-                            existing_data[key]["is_active"] = 1
-
-                            if not existing_data[key].get("sample_job_url"):
-                                existing_data[key]["sample_job_url"] = sample_job_url
-
-                        else:
-                             existing_data[key] = {
-                                 "state": state_name,
-                                 "role_category": role_category,
-                                 "job_title": job_title,
-                                 "location": location,
-                                 "search_keyword": search_keyword,
-                                 "sample_job_url": sample_job_url,
-                                 "first_seen_at": now_time(),
-                                 "last_seen_at": now_time(),
-                                 "seen_count": 1,
-                                 "is_active": 1,
-                                 "source_platform": "Naukri",
-                                 "source_type": "job_portal",
-                             }
-
-                        input_row = {
-                            "state": state_name,
-                            "role_category": role_category,
-                            "job_title": job_title,
-                            "location": location,
-                            "city": location,
-                            "search_keyword": search_keyword,
-                            "sample_job_url": sample_job_url,
-                            "source_platform": "Naukri",
-                            "source_type": "job_portal",
-                            "is_fake": False,
-                            "is_active": True,
-                        }
-
-                        detail_row = await scrape_job_detail_async(
-                            detail_page,
-                            sample_job_url,
-                            input_row
-                        )
-
-                        append_detail_to_excel(detail_row, "current_data.xlsx")
-                    updated_df = pd.DataFrame(existing_data.values())
-                    save_master(updated_df)
-                    print(f"    Saved → {OUTPUT_FILE}  |  Total unique: {len(updated_df):,}")
-
-                    if len(jobs) == 0 and page_number > 1:
+                    if jobs_on_page == 0 and page_number > 1:
                         print("  Empty page — stopping pagination early")
                         break
 
                     await asyncio.sleep(WAIT_SECONDS)
 
+                # All known pages done → retry deferred 5xx pages (this combo's
+                # and any older ones, incl. deferred page-1 combinations).
+                await process_deferred_pages()
+
                 # combo fully done — reset page to 1 ready for next combo
                 save_city_state(location, page_number=1)
+
+            except NaukriServerError as srv:
+                # Only page 1 can raise this here: pagination and detail 5xx are
+                # handled lower down. total_pages is unknown, so the WHOLE
+                # combination is deferred; nothing is marked completed.
+                await defer_listing_page(
+                    state_name, role_category, search_keyword, location,
+                    1, page1_url, srv.status, srv.attempts, total_pages=None,
+                )
+                continue
 
             except NaukriNavigationStop as stopped:
                 # 403 or 429 retries exhausted. Checkpoint files still hold the
@@ -1539,6 +2006,11 @@ async def main():
                     print(f"  ERROR: {e} — state saved, re-run to continue.")
                     await browser.close()
                     return
+
+        # Final pass over anything still deferred; leftovers stay in the queue
+        # files for the next run.
+        await process_deferred_pages()
+        await process_deferred_jobs()
 
         await context.close()
         await browser.close()
