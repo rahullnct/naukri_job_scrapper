@@ -19,17 +19,36 @@ from playwright.async_api import async_playwright
 from new_mylib import job_by_department, city_by_states, city_to_state
 
 # --------------------------------------------------
-# INTERNET CHECK
+# CONFIG  (same layout as ats_url_extractor.py)
 # --------------------------------------------------
 rank = 1
-num_sys = 5
+total_scripts = 3
+num_sys = total_scripts     # legacy name used by the city split below
+
+BASE_URL = "https://www.naukri.com"
+
+# Per-rank files: every state / output / log file carries the rank suffix so
+# several ranks can run side by side without overwriting each other.
+OUTPUT_FILE = f"naukri_it_jobs_by_city_{rank}.xlsx"      # master (unique titles per city)
+DETAIL_OUTPUT_FILE = f"current_data_{rank}.xlsx"          # job details, rolled into cycle files
+CYCLE_SIZE = 100                                          # rows per current_data_<rank>_cycleN.xlsx
+
+CITY_STATE_FILE = f"state_city_{rank}.json"               # stores: city_name, page_number
+ROLE_STATE_FILE = f"state_role_{rank}.json"               # stores: role_category, search_keyword
+CYCLE_STATE_FILE = f"cycle_state_{rank}.json"             # stores: cycle_num
+
+ACCESS_EVENTS_LOG_FILE = f"naukri_access_events_{rank}.log"   # 403 / 429 / 5xx / challenge events
+FAILED_5XX_PAGE_QUEUE_FILE = f"state_5xx_pages_{rank}.json"   # FAILED_5XX_PAGE_QUEUE
+FAILED_5XX_JOB_QUEUE_FILE = f"state_5xx_jobs_{rank}.json"     # FAILED_5XX_JOB_QUEUE
+UNRESOLVED_5XX_FILE = f"naukri_5xx_unresolved_{rank}.json"
+
+JOBS_PER_PAGE = 20
+WAIT_SECONDS = 2
+BATTERY_STOP_PCT = 20
 
 INTERNET_CHECK_HOST    = "8.8.8.8"
 INTERNET_CHECK_PORT    = 53
 INTERNET_CHECK_TIMEOUT = 3
-DETAIL_OUTPUT_FILE = "current_data.xlsx"
-BATTERY_STOP_PCT = 20
-CYCLE_STATE_FILE = "cycle_state.json"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 AUTH_FILE = os.path.join(BASE_DIR, "naukri_auth.json")
@@ -158,14 +177,14 @@ def save_cycle_num(cycle_num: int) -> None:
         json.dump({"cycle_num": cycle_num}, f, indent=4)
 
 
-def get_next_cycle_file(base_file="current_data.xlsx"):
+def get_next_cycle_file(base_file=DETAIL_OUTPUT_FILE):
     """
     Returns next cycle file name using cycle_state.json.
 
     Example:
-    cycle_num = 0 → current_data_cycle1.xlsx
-    cycle_num = 1 → current_data_cycle2.xlsx
-    cycle_num = 2 → current_data_cycle3.xlsx
+    cycle_num = 0 → current_data_<rank>_cycle1.xlsx
+    cycle_num = 1 → current_data_<rank>_cycle2.xlsx
+    cycle_num = 2 → current_data_<rank>_cycle3.xlsx
     """
     base_name = os.path.splitext(base_file)[0]
 
@@ -177,7 +196,7 @@ def get_next_cycle_file(base_file="current_data.xlsx"):
     return cycle_file, next_cycle
 
 
-def append_detail_to_excel(row: dict, output_file: str = DETAIL_OUTPUT_FILE, cycle_size: int = 100):
+def append_detail_to_excel(row: dict, output_file: str = DETAIL_OUTPUT_FILE, cycle_size: int = CYCLE_SIZE):
     """
     Append job detail to current_data.xlsx.
 
@@ -553,7 +572,6 @@ HTTP_403_COOLDOWNS_SECONDS = [
     60 * 60,
 ]
 HTTP_403_MAX_RETRIES = len(HTTP_403_COOLDOWNS_SECONDS)
-ACCESS_EVENTS_LOG_FILE = "naukri_access_events.log"
 
 # HTTP 429 = Naukri is rate-limiting. Also NOT a network failure. A valid
 # Retry-After header always wins (even when longer than the fallback); the
@@ -588,9 +606,6 @@ HTTP_5XX_JITTER_FRACTION = 0.2                 # +/- 20% of the base delay
 HTTP_5XX_PAGE_DEFER_COOLDOWN_SECONDS = 10 * 60 # wait before the next known page
 HTTP_5XX_DEFERRED_PAGE_MAX_RETRIES = 2
 HTTP_5XX_DEFERRED_JOB_MAX_RETRIES = 2
-FAILED_5XX_PAGE_QUEUE_FILE = "state_5xx_pages.json"   # FAILED_5XX_PAGE_QUEUE
-FAILED_5XX_JOB_QUEUE_FILE = "state_5xx_jobs.json"     # FAILED_5XX_JOB_QUEUE
-UNRESOLVED_5XX_FILE = "naukri_5xx_unresolved.json"
 
 # Title fragments of security/challenge interstitials. Used ONLY to log that a
 # non-403 response is not a normal job page. Nothing here tries to pass them.
@@ -1226,16 +1241,8 @@ async def safe_naukri_navigate(page, url: str, *, wait_until="domcontentloaded",
         return response
 
 # --------------------------------------------------
-# CONFIG
+# (file names, JOBS_PER_PAGE and WAIT_SECONDS live in the CONFIG block at the top)
 # --------------------------------------------------
-OUTPUT_FILE   = "naukri_it_jobs_by_city.xlsx"
-
-# ✅ Two separate state files instead of one
-CITY_STATE_FILE = "state_city.json"    # stores: city_name, page_number
-ROLE_STATE_FILE = "state_role.json"    # stores: role_category, search_keyword
-
-JOBS_PER_PAGE = 20
-WAIT_SECONDS  = 2
 
 # --------------------------------------------------
 # CITY STATE  (city name + page number)
@@ -1436,7 +1443,7 @@ def make_unique_key(role_category: str, job_title: str, location: str) -> str:
 def build_search_url(keyword: str, location: str, page_number: int) -> str:
     kslug = make_slug(keyword)
     lslug = make_slug(location)
-    base  = f"https://www.naukri.com/{kslug}-jobs-in-{lslug}"
+    base  = f"{BASE_URL}/{kslug}-jobs-in-{lslug}"
     if page_number == 1:
         return base
     return f"{base}-{page_number}"
@@ -1564,7 +1571,10 @@ async def main():
     start_search_index = find_resume_index(ALL_SEARCHES, city_state, role_state)
     start_page_number  = city_state.get("page_number", 1)
 
-    print(f"\nTotal search combos : {total:,}")
+    print(f"\nRank / scripts      : {rank} / {total_scripts}")
+    print(f"Per-rank files      : {DETAIL_OUTPUT_FILE}, {OUTPUT_FILE}, "
+          f"{CITY_STATE_FILE}, {ROLE_STATE_FILE}")
+    print(f"Total search combos : {total:,}")
     print(f"Resuming at         : combo #{start_search_index + 1}/{total}")
     print(f"  city              : {city_state.get('city_name') or 'first city (fresh start)'}")
     print(f"  role_category     : {role_state.get('role_category') or '—'}")
@@ -1632,7 +1642,7 @@ async def main():
                     detail_row, failed_status = None, srv.status
                 if isinstance(detail_row, dict):
                     # Real success: navigated, passed the P5 job-id guard, row built.
-                    append_detail_to_excel(detail_row, "current_data.xlsx")
+                    append_detail_to_excel(detail_row, DETAIL_OUTPUT_FILE)
                     remove_5xx_item(FAILED_5XX_JOB_QUEUE_FILE, job_url)
                     log_access_event("HTTP_5XX_JOB_RECOVERED", job_url, 200, ctx,
                                      nav_type="JOB_DETAIL", job_url=job_url,
@@ -1737,7 +1747,7 @@ async def main():
                                      attempt=srv.attempts, action="added to FAILED_5XX_JOB_QUEUE")
                     continue
 
-                append_detail_to_excel(detail_row, "current_data.xlsx")
+                append_detail_to_excel(detail_row, DETAIL_OUTPUT_FILE)
             updated_df = pd.DataFrame(existing_data.values())
             save_master(updated_df)
             print(f"    Saved → {OUTPUT_FILE}  |  Total unique: {len(updated_df):,}")

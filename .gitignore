@@ -1,2 +1,15 @@
 venv/
-venv/
+__pycache__/
+
+# worker copies created by 1.copy_naukri_folders.sh (naukri1 is the source and IS tracked)
+naukri[2-9]/
+naukri[1-9][0-9]/
+.naukri_pids/
+
+# per-rank runtime files inside the source folder
+naukri1/state_*.json
+naukri1/cycle_state*.json
+naukri1/naukri_5xx_unresolved*.json
+naukri1/*.xlsx
+naukri1/*.log
+naukri1/__pycache__/
